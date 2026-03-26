@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -110,6 +110,20 @@ def _cache_multimodal_embeddings(
     )
 
 
+def _get_param_hash_key(param: MultimodalParams) -> Optional[tuple]:
+    """Return a hashable cache key derived from the param's content hashes.
+
+    Returns None when hashing metadata is unavailable, in which case the param
+    is always forwarded to the encoder without deduplication.
+    """
+    if param.multimodal_input is None:
+        return None
+    hashes = param.multimodal_input.multimodal_hashes
+    if not hashes:
+        return None
+    return tuple(tuple(h) for h in hashes)
+
+
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
         [List[MultimodalParams]],
@@ -123,7 +137,9 @@ def get_multimodal_embeddings(
 
     This function will:
     1. Identify which parameters need encoder processing
-    2. Run encoder forward only on uncached parameters
+    2. Run encoder forward only on uncached parameters, with intra-step
+       cross-request deduplication so identical images in the same batch
+       are encoded only once
     3. Cache newly computed embeddings (if enabled)
     4. Gather all embeddings for the batch
 
@@ -139,34 +155,97 @@ def get_multimodal_embeddings(
     if not multimodal_params:
         return []
 
-    # Step 1: Find uncached multimodal params that need encoder processing
+    # Step 1: Find uncached multimodal params that need encoder processing.
     uncached_multimodal_params = _get_uncached_multimodal_params(
         multimodal_params)
 
-    # Step 2: Run encoder forward only on uncached parameters
+    # Step 2: Run encoder forward only on uncached parameters, deduplicating
+    # identical images within the same scheduling step to avoid redundant
+    # encoder calls for requests that share the same image content.
     if uncached_multimodal_params:
-        kwargs = encoder_kwargs or {}
-        encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
-                                                **kwargs)
+        # Build a step-level hash cache seeded from params that already have
+        # embeddings (computed in a prior step).  This lets same-hash params
+        # arriving later in the same step also benefit from the cache.
+        uncached_ids = {id(p) for p in uncached_multimodal_params}
+        step_cache: Dict[tuple, torch.Tensor] = {}
+        for param in multimodal_params:
+            if id(param) not in uncached_ids:
+                hash_key = _get_param_hash_key(param)
+                emb = param.multimodal_data.get(
+                    "multimodal_embedding"
+                ) if param.multimodal_data else None
+                if hash_key is not None and emb is not None:
+                    step_cache[hash_key] = emb
 
-        # TODO: support multiple multimodal modalities per request
-        if len(encoder_embeddings) > 1:
-            logger.warning("Multiple modalities caching is not supported yet.")
-            return encoder_embeddings
+        # Partition uncached params into:
+        #   truly_uncached      — need encoder (first occurrence of their hash)
+        #   dedup_targets       — duplicates of a truly_uncached param in this batch
+        # Params whose hash is already in step_cache get their embedding applied now.
+        hash_to_first_param: Dict[tuple, MultimodalParams] = {}
+        dedup_targets: List[tuple] = []  # (param, hash_key)
+        truly_uncached: List[MultimodalParams] = []
 
-        # Validate that multimodal_runtime has required attributes for caching
-        if (not hasattr(uncached_multimodal_params[0], 'multimodal_runtime')
-                or uncached_multimodal_params[0].multimodal_runtime is None
-                or uncached_multimodal_params[0].multimodal_runtime.
-                total_mm_tokens_in_request is None):
-            logger.warning(
-                "Multimodal runtime data missing or incomplete, will not cache embeddings."
+        for param in uncached_multimodal_params:
+            hash_key = _get_param_hash_key(param)
+            if hash_key is None:
+                truly_uncached.append(param)
+            elif hash_key in step_cache:
+                param.multimodal_data[
+                    "multimodal_embedding"] = step_cache[hash_key]
+                logger.debug(
+                    "Intra-step dedup: reusing prior-step cached embedding")
+            elif hash_key in hash_to_first_param:
+                dedup_targets.append((param, hash_key))
+            else:
+                truly_uncached.append(param)
+                hash_to_first_param[hash_key] = param
+
+        num_deduped = len(uncached_multimodal_params) - len(truly_uncached)
+        if num_deduped > 0:
+            logger.debug(
+                f"Intra-step dedup: skipped encoder for {num_deduped} of "
+                f"{len(uncached_multimodal_params)} params with duplicate hashes"
             )
-            return encoder_embeddings
 
-        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
-        _cache_multimodal_embeddings(uncached_multimodal_params,
-                                     encoder_embeddings)
+        if truly_uncached:
+            kwargs = encoder_kwargs or {}
+            encoder_embeddings = encoder_forward_fn(truly_uncached, **kwargs)
+
+            # TODO: support multiple multimodal modalities per request
+            if len(encoder_embeddings) > 1:
+                logger.warning(
+                    "Multiple modalities caching is not supported yet.")
+                return encoder_embeddings
+
+            # Validate that multimodal_runtime has required attributes for caching
+            if (not hasattr(truly_uncached[0], 'multimodal_runtime')
+                    or truly_uncached[0].multimodal_runtime is None
+                    or truly_uncached[0].multimodal_runtime.
+                    total_mm_tokens_in_request is None):
+                logger.warning(
+                    "Multimodal runtime data missing or incomplete, will not cache embeddings."
+                )
+                return encoder_embeddings
+
+            # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
+            _cache_multimodal_embeddings(truly_uncached, encoder_embeddings)
+
+            # Populate step_cache with freshly computed embeddings so
+            # dedup_targets (intra-batch duplicates) can reuse them below.
+            for hash_key, param in hash_to_first_param.items():
+                emb = param.multimodal_data.get("multimodal_embedding")
+                if emb is not None:
+                    step_cache[hash_key] = emb
+
+        # Apply embeddings to intra-batch duplicate params.
+        for param, hash_key in dedup_targets:
+            emb = step_cache.get(hash_key)
+            if emb is not None:
+                param.multimodal_data["multimodal_embedding"] = emb
+            else:
+                logger.warning(
+                    "Intra-step dedup: no embedding found for hash key after "
+                    "encoder run; param will have no embedding.")
 
     # Step 4: Gather all embeddings for the batch
     for param in multimodal_params:
