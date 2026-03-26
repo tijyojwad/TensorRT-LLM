@@ -5,8 +5,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds, get_multimodal_embeddings)
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+    _get_param_hash_key, find_input_mm_embeds, get_multimodal_embeddings)
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData)
 
 
@@ -831,6 +831,302 @@ class TestGetMultimodalEmbeddings:
             cached_emb)
         assert multimodal_params[1].multimodal_data[
             "multimodal_embedding"].shape == (9, 512)
+
+
+class TestGetParamHashKey:
+    """Unit tests for the _get_param_hash_key helper."""
+
+    HASH_A = [1, 2, 3, 4, 5, 6, 7, 8]
+    HASH_B = [9, 10, 11, 12, 13, 14, 15, 16]
+
+    def _make_input(self, hashes):
+        return MultimodalInput.from_components(mm_hashes=hashes,
+                                               mm_positions=list(
+                                                   range(len(hashes))),
+                                               mm_lengths=[10] * len(hashes))
+
+    def test_no_multimodal_input_returns_none(self):
+        """Param without multimodal_input yields None (no dedup)."""
+        param = MultimodalParams()
+        assert _get_param_hash_key(param) is None
+
+    def test_single_image_returns_tuple_of_tuple(self):
+        """Single-image param returns a 1-element outer tuple."""
+        mm_input = self._make_input([self.HASH_A])
+        param = MultimodalParams(multimodal_input=mm_input)
+        key = _get_param_hash_key(param)
+        assert key == (tuple(self.HASH_A), )
+
+    def test_multi_image_returns_tuple_per_image(self):
+        """Multi-image param returns one inner tuple per image."""
+        mm_input = self._make_input([self.HASH_A, self.HASH_B])
+        param = MultimodalParams(multimodal_input=mm_input)
+        key = _get_param_hash_key(param)
+        assert key == (tuple(self.HASH_A), tuple(self.HASH_B))
+
+    def test_same_hashes_produce_equal_keys(self):
+        """Two params with identical hashes produce equal keys (dedup will fire)."""
+        param1 = MultimodalParams(multimodal_input=self._make_input([self.HASH_A]))
+        param2 = MultimodalParams(multimodal_input=self._make_input([self.HASH_A]))
+        assert _get_param_hash_key(param1) == _get_param_hash_key(param2)
+
+    def test_different_hashes_produce_different_keys(self):
+        """Two params with different hashes produce different keys."""
+        param1 = MultimodalParams(multimodal_input=self._make_input([self.HASH_A]))
+        param2 = MultimodalParams(multimodal_input=self._make_input([self.HASH_B]))
+        assert _get_param_hash_key(param1) != _get_param_hash_key(param2)
+
+    def test_key_is_usable_as_dict_key(self):
+        """Returned key must be hashable for use in the step_cache dict."""
+        mm_input = self._make_input([self.HASH_A])
+        param = MultimodalParams(multimodal_input=mm_input)
+        key = _get_param_hash_key(param)
+        d = {key: "sentinel"}
+        assert d[key] == "sentinel"
+
+
+class TestIntraStepEncoderDedup:
+    """Tests for the intra-step cross-request encoder deduplication in
+    get_multimodal_embeddings().
+
+    These tests verify that identical images within a single scheduling step
+    are encoded only once, and that the resulting embedding is shared to all
+    requests that submitted the same image.
+    """
+
+    HASH_A = [1, 2, 3, 4, 5, 6, 7, 8]
+    HASH_B = [9, 10, 11, 12, 13, 14, 15, 16]
+    HIDDEN = 512
+
+    def _make_input(self, hash_ints, total_mm_tokens):
+        return MultimodalInput.from_components(mm_hashes=[hash_ints],
+                                               mm_positions=[0],
+                                               mm_lengths=[total_mm_tokens])
+
+    def _make_param(self,
+                    hash_ints=None,
+                    total_mm_tokens=10,
+                    has_cached_embedding=False,
+                    cached_embedding=None):
+        """Create a MultimodalParams, optionally with a hash and/or pre-cached embedding."""
+        runtime = Mock(spec=MultimodalRuntimeData)
+        runtime.total_mm_tokens_in_request = total_mm_tokens
+        runtime.total_special_tokens_in_request = 0
+
+        multimodal_data = {"image": {"pixel_values": torch.randn(3, 224, 224)}}
+        if has_cached_embedding:
+            emb = cached_embedding if cached_embedding is not None else torch.randn(
+                total_mm_tokens, self.HIDDEN)
+            multimodal_data["multimodal_embedding"] = emb
+
+        multimodal_input = None
+        if hash_ints is not None:
+            multimodal_input = self._make_input(hash_ints, total_mm_tokens)
+
+        return MultimodalParams(multimodal_data=multimodal_data,
+                                multimodal_input=multimodal_input,
+                                multimodal_runtime=runtime)
+
+    def _make_encoder(self):
+        """Return (encoder_fn, call_count, received_params).
+
+        call_count is a mutable list so the closure can mutate it.
+        received_params is the list of params passed to the last encoder call.
+        """
+        state = {"calls": 0, "params": []}
+
+        def encoder(params):
+            state["calls"] += 1
+            state["params"] = list(params)
+            total = sum(p.multimodal_runtime.total_mm_tokens_in_request
+                        for p in params)
+            return [torch.randn(total, self.HIDDEN)]
+
+        return encoder, state
+
+    # ------------------------------------------------------------------
+    # Core dedup behaviour
+    # ------------------------------------------------------------------
+
+    def test_two_requests_same_hash_encoder_called_once(self):
+        """Duplicate image in a two-request batch: encoder fires once."""
+        encoder, state = self._make_encoder()
+        param_a = self._make_param(self.HASH_A, total_mm_tokens=10)
+        param_b = self._make_param(self.HASH_A, total_mm_tokens=10)
+
+        result = get_multimodal_embeddings(encoder, [param_a, param_b])
+
+        assert state["calls"] == 1
+        assert len(state["params"]) == 1
+        assert state["params"][0] is param_a
+
+        # Both params must have an embedding
+        emb_a = param_a.multimodal_data["multimodal_embedding"]
+        emb_b = param_b.multimodal_data["multimodal_embedding"]
+        assert emb_a is not None
+        assert emb_b is not None
+
+        # The duplicate must carry the same values as the canonical
+        torch.testing.assert_close(emb_a, emb_b)
+
+        # Final output shape: 10 (A) + 10 (B) = 20
+        assert len(result) == 1
+        assert result[0].shape == (20, self.HIDDEN)
+
+    def test_triplicate_image_encoder_called_once(self):
+        """Three requests all sharing the same image: encoder fires once."""
+        encoder, state = self._make_encoder()
+        params = [self._make_param(self.HASH_A, 5) for _ in range(3)]
+
+        result = get_multimodal_embeddings(encoder, params)
+
+        assert state["calls"] == 1
+        assert len(state["params"]) == 1  # only the first one sent to encoder
+
+        # All three embeddings have the same values
+        emb0 = params[0].multimodal_data["multimodal_embedding"]
+        for p in params[1:]:
+            torch.testing.assert_close(p.multimodal_data["multimodal_embedding"],
+                                       emb0)
+
+        # Output: 5 * 3 = 15 tokens
+        assert result[0].shape == (15, self.HIDDEN)
+
+    def test_unique_and_duplicate_images_in_same_batch(self):
+        """A(unique), B(unique), C(dup of A): encoder fires for A and B only."""
+        encoder, state = self._make_encoder()
+        param_a = self._make_param(self.HASH_A, total_mm_tokens=10)
+        param_b = self._make_param(self.HASH_B, total_mm_tokens=8)
+        param_c = self._make_param(self.HASH_A, total_mm_tokens=10)  # dup of A
+
+        result = get_multimodal_embeddings(encoder, [param_a, param_b, param_c])
+
+        assert state["calls"] == 1
+        assert len(state["params"]) == 2
+        assert state["params"][0] is param_a
+        assert state["params"][1] is param_b
+
+        # C's embedding values should match A's
+        torch.testing.assert_close(
+            param_a.multimodal_data["multimodal_embedding"],
+            param_c.multimodal_data["multimodal_embedding"])
+
+        # Output: 10 + 8 + 10 = 28 tokens
+        assert result[0].shape == (28, self.HIDDEN)
+
+    # ------------------------------------------------------------------
+    # Prior-step cache (params that already have embeddings)
+    # ------------------------------------------------------------------
+
+    def test_prior_step_cache_hit_skips_encoder(self):
+        """A param whose hash matches a prior-step cached embedding skips encoding."""
+        encoder, state = self._make_encoder()
+
+        prior_embedding = torch.randn(10, self.HIDDEN)
+        param_cached = self._make_param(self.HASH_A,
+                                        total_mm_tokens=10,
+                                        has_cached_embedding=True,
+                                        cached_embedding=prior_embedding)
+        param_new = self._make_param(self.HASH_A,
+                                     total_mm_tokens=10,
+                                     has_cached_embedding=False)
+
+        result = get_multimodal_embeddings(encoder,
+                                           [param_cached, param_new])
+
+        # Encoder must not be called at all
+        assert state["calls"] == 0
+
+        # The new param should have gotten the prior-step embedding
+        torch.testing.assert_close(
+            param_new.multimodal_data["multimodal_embedding"], prior_embedding)
+
+        # Output: 10 (prior-step) + 10 (deduped) = 20 tokens
+        assert result[0].shape == (20, self.HIDDEN)
+
+    def test_prior_step_cache_with_intra_batch_dup(self):
+        """Mix of prior-step hit and intra-batch dup: encoder skipped entirely."""
+        encoder, state = self._make_encoder()
+
+        prior_embedding = torch.randn(10, self.HIDDEN)
+        param_cached = self._make_param(self.HASH_A,
+                                        total_mm_tokens=10,
+                                        has_cached_embedding=True,
+                                        cached_embedding=prior_embedding)
+        # Two new params with the same hash as the cached one
+        param_new1 = self._make_param(self.HASH_A, total_mm_tokens=10)
+        param_new2 = self._make_param(self.HASH_A, total_mm_tokens=10)
+
+        result = get_multimodal_embeddings(encoder,
+                                           [param_cached, param_new1, param_new2])
+
+        assert state["calls"] == 0
+
+        for p in [param_new1, param_new2]:
+            torch.testing.assert_close(
+                p.multimodal_data["multimodal_embedding"], prior_embedding)
+
+        assert result[0].shape == (30, self.HIDDEN)  # 3 × 10
+
+    # ------------------------------------------------------------------
+    # No-hash fallback (no dedup without hash metadata)
+    # ------------------------------------------------------------------
+
+    def test_no_hash_no_dedup(self):
+        """Params without multimodal_input (no hash) are always forwarded to encoder."""
+        encoder, state = self._make_encoder()
+        param_a = self._make_param(hash_ints=None, total_mm_tokens=10)
+        param_b = self._make_param(hash_ints=None, total_mm_tokens=10)
+
+        get_multimodal_embeddings(encoder, [param_a, param_b])
+
+        # Both must go to the encoder
+        assert state["calls"] == 1
+        assert len(state["params"]) == 2
+
+    def test_mixed_hash_and_no_hash(self):
+        """Mix of hashed and unhashed params: only hashed ones deduped."""
+        encoder, state = self._make_encoder()
+        param_a = self._make_param(self.HASH_A, total_mm_tokens=10)
+        param_no_hash = self._make_param(None, total_mm_tokens=8)
+        param_b = self._make_param(self.HASH_A, total_mm_tokens=10)  # dup of A
+
+        result = get_multimodal_embeddings(encoder,
+                                           [param_a, param_no_hash, param_b])
+
+        # A and no_hash go to encoder; B is deduped
+        assert state["calls"] == 1
+        assert len(state["params"]) == 2
+        assert param_a in state["params"]
+        assert param_no_hash in state["params"]
+        assert param_b not in state["params"]
+
+        torch.testing.assert_close(
+            param_a.multimodal_data["multimodal_embedding"],
+            param_b.multimodal_data["multimodal_embedding"])
+
+    # ------------------------------------------------------------------
+    # No regression: all-unique batch behaves identically to before
+    # ------------------------------------------------------------------
+
+    def test_all_unique_hashes_no_dedup_applied(self):
+        """All unique images: every param goes to encoder, output unchanged."""
+        encoder, state = self._make_encoder()
+        param_a = self._make_param(self.HASH_A, total_mm_tokens=10)
+        param_b = self._make_param(self.HASH_B, total_mm_tokens=8)
+
+        result = get_multimodal_embeddings(encoder, [param_a, param_b])
+
+        assert state["calls"] == 1
+        assert len(state["params"]) == 2
+        assert result[0].shape == (18, self.HIDDEN)
+
+    def test_empty_params_no_encoder_call(self):
+        """Empty params list: encoder is never called (unchanged behaviour)."""
+        encoder, state = self._make_encoder()
+        result = get_multimodal_embeddings(encoder, [])
+        assert state["calls"] == 0
+        assert result == []
 
 
 if __name__ == "__main__":
