@@ -31,6 +31,8 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .nvfp4_compat_linear import (NVFP4ToBF16LinearMethod,
+                                  NVFP4ToFP8RowwiseLinearMethod)
 
 
 class WeightMode(str, enum.Enum):
@@ -2428,6 +2430,10 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return FP8RowwiseLinearMethod()
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
+    if quant_config.quant_algo == QuantAlgo.NVFP4_TO_FP8_ROWWISE:
+        return NVFP4ToFP8RowwiseLinearMethod()
+    if quant_config.quant_algo == QuantAlgo.NVFP4_TO_BF16:
+        return NVFP4ToBF16LinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()

@@ -46,6 +46,10 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A16_MXFP4 = auto()
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
+    # Load-time dequant shims: convert NVFP4 checkpoint to a wider dtype at
+    # model load time so it can run on GPUs without native FP4 tensor cores.
+    NVFP4_TO_FP8_ROWWISE = auto()  # H100 (SM90+): dequant FP4 → FP8 rowwise
+    NVFP4_TO_BF16 = auto()  # A100 (SM80) and older: dequant FP4 → BF16
     NO_QUANT = auto()
 
 
