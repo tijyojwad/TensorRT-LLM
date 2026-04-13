@@ -1,4 +1,10 @@
-"""Test the metrics endpoint when using OpenAI API to send requests"""
+"""Test the metrics and iteration_stats endpoints when using OpenAI API.
+
+After the fix for NVBug 6062537:
+- /metrics serves Prometheus exposition format (was previously JSON iteration stats)
+- /iteration_stats serves JSON iteration stats (moved from /metrics)
+- /prometheus/metrics serves Prometheus exposition format (backward compat)
+"""
 
 from unittest.mock import patch
 
@@ -60,7 +66,7 @@ def test_metrics(client):
                            })
     assert response.status_code == 200
     assert "D E F" in response.json()["choices"][0]["text"]
-    response = client.get("/metrics")
+    response = client.get("/iteration_stats")
     assert response.status_code == 200
     response_dict = response.json()[0]
     assert "cpuMemUsage" in response_dict
@@ -114,3 +120,46 @@ def test_metrics(client):
     assert "iterGenAllocBlocks" in ws_stats
     assert "iterOnboardBlocks" in ws_stats
     assert "iterOnboardBytes" in ws_stats
+
+
+def test_metrics_returns_prometheus_format(client):
+    """Verify /metrics returns Prometheus exposition format, not JSON."""
+    response = client.get("/metrics")
+    assert response.status_code == 200
+
+    content_type = response.headers.get("content-type", "")
+    assert "text/plain" in content_type or "text/openmetrics" in content_type, \
+        f"Expected Prometheus text format, got Content-Type: {content_type}"
+
+    body = response.text
+    assert not body.strip().startswith("{"), \
+        "/metrics should return Prometheus format, not JSON"
+    assert not body.strip().startswith("["), \
+        "/metrics should return Prometheus format, not JSON array"
+
+
+def test_prometheus_metrics_backward_compat(client):
+    """Verify /prometheus/metrics returns Prometheus format for backward compat."""
+    response = client.get("/prometheus/metrics")
+    assert response.status_code == 200
+
+    body = response.text
+    assert not body.strip().startswith("{"), \
+        "/prometheus/metrics should return Prometheus format, not JSON"
+
+
+def test_iteration_stats_returns_json(client):
+    """Verify /iteration_stats returns JSON iteration stats."""
+    response = client.post("/v1/completions",
+                           json={
+                               "prompt": "A B C",
+                               "model": llama_model_path,
+                               "max_tokens": 10
+                           })
+    assert response.status_code == 200
+
+    response = client.get("/iteration_stats")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert isinstance(data, list), "/iteration_stats should return a JSON list"

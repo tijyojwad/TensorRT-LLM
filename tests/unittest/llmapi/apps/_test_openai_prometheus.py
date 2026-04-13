@@ -84,7 +84,7 @@ def _parse_prometheus_sample(data: str, metric_name: str) -> float | None:
     do not match the pattern.
 
     Args:
-        data: Raw Prometheus exposition text from the /prometheus/metrics endpoint.
+        data: Raw Prometheus exposition text from the /metrics endpoint.
         metric_name: Fully qualified metric name to search for (e.g.
             "trtllm_kv_cache_hit_rate").
 
@@ -128,7 +128,7 @@ def _parse_all_kv_metrics(data: str, prefix: str) -> Dict[str, float | None]:
 def test_metrics_endpoint(server: RemoteOpenAIServer):
     """Verify that Prometheus metrics are correctly exposed after serving requests.
 
-    Sends two identical completion requests, then polls the /prometheus/metrics
+    Sends two identical completion requests, then polls the /metrics
     endpoint until iteration-level KV cache metrics appear. Asserts that:
     - Request-level metrics (success count, latencies) are present.
     - KV cache metrics have sample values (not just HELP/TYPE lines).
@@ -157,7 +157,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
 
     iteration_stats_metrics_found = False
     while time.time() - start_time < max_wait_time:
-        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        response = urlopen(f'{server.url_root}/metrics')
         assert response.status == 200
 
         data = response.read().decode("utf-8")
@@ -176,7 +176,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
         time.sleep(poll_interval)
 
     # Final check: fetch metrics one more time for assertions
-    response = urlopen(f'{server.url_root}/prometheus/metrics')
+    response = urlopen(f'{server.url_root}/metrics')
     assert response.status == 200
     data = response.read().decode("utf-8")
 
@@ -212,3 +212,77 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
 
     assert METRIC_PREFIX + "kv_cache_hit_rate" in data
     assert METRIC_PREFIX + "kv_cache_iter_reuse_rate" in data
+
+    # Assert new iteration-level gauges added for parity with JSON iteration_stats
+    new_parity_metrics = [
+        "iteration_counter",
+        "num_requests_running",
+        "num_requests_waiting",
+        "num_requests_completed_total",
+        "max_num_active_requests",
+        "iteration_latency_seconds",
+        "gpu_memory_usage_bytes",
+        "cpu_memory_usage_bytes",
+        "max_batch_size_static",
+        "max_batch_size_runtime",
+        "max_num_tokens_runtime",
+        "kv_cache_max_blocks",
+        "kv_cache_free_blocks",
+        "kv_cache_used_blocks",
+        "kv_cache_tokens_per_block",
+        "num_context_requests",
+        "num_generation_requests",
+    ]
+    for metric in new_parity_metrics:
+        full_name = METRIC_PREFIX + metric
+        assert full_name in data, f"Expected {full_name} in Prometheus output"
+
+
+def test_metrics_endpoint_returns_prometheus_format(server: RemoteOpenAIServer):
+    """Verify /metrics returns Prometheus exposition format, not JSON."""
+    response = urlopen(f'{server.url_root}/metrics')
+    assert response.status == 200
+
+    content_type = response.headers.get("Content-Type", "")
+    assert "text/plain" in content_type or "text/openmetrics" in content_type, \
+        f"Expected Prometheus text format, got Content-Type: {content_type}"
+
+    data = response.read().decode("utf-8")
+    assert not data.strip().startswith("{"), \
+        "/metrics should return Prometheus format, not JSON"
+    assert "# HELP" in data or "# TYPE" in data, \
+        "/metrics should contain Prometheus HELP/TYPE headers"
+
+
+def test_prometheus_metrics_backward_compat_endpoint(
+        server: RemoteOpenAIServer):
+    """Verify /prometheus/metrics still works for backward compatibility."""
+    response = urlopen(f'{server.url_root}/prometheus/metrics')
+    assert response.status == 200
+
+    data = response.read().decode("utf-8")
+    assert "# HELP" in data or "# TYPE" in data, \
+        "/prometheus/metrics should return Prometheus format"
+    assert "trtllm_" in data, \
+        "/prometheus/metrics should contain trtllm_ metrics"
+
+
+def test_iteration_stats_endpoint_returns_json(server: RemoteOpenAIServer):
+    """Verify /iteration_stats returns JSON (the old /metrics behavior)."""
+    import json
+
+    client = server.get_client()
+    client.completions.create(
+        model="Server",
+        prompt="Hello, my name is",
+        max_tokens=10,
+        stream=False,
+    )
+
+    response = urlopen(f'{server.url_root}/iteration_stats')
+    assert response.status == 200
+
+    data = response.read().decode("utf-8")
+    parsed = json.loads(data)
+    assert isinstance(parsed,
+                      list), "/iteration_stats should return a JSON list"

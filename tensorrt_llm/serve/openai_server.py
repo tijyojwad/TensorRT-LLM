@@ -563,8 +563,7 @@ class OpenAIServer:
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
         self.app.add_api_route("/perf_metrics",
@@ -614,9 +613,7 @@ class OpenAIServer:
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
-        if self.generator.args.return_perf_metrics:
-            # register /prometheus/metrics
-            self.mount_metrics()
+        self.mount_metrics()
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
@@ -635,17 +632,23 @@ class OpenAIServer:
             registry=registry,
         ).add().instrument(self.app).expose(self.app)
         metrics_app = make_asgi_app(registry=registry)
-        metrics_route = Mount("/prometheus/metrics", metrics_app)
-        metrics_route.path_regex = re.compile(
-            "^/prometheus/metrics(?P<path>.*)$")
+
+        # Serve at /metrics (industry standard, compatible with AIPerf/vLLM/SGLang)
+        metrics_route = Mount("/metrics", metrics_app)
+        metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
         self.app.routes.append(metrics_route)
+
+        # Keep /prometheus/metrics for backward compatibility
+        compat_route = Mount("/prometheus/metrics", metrics_app)
+        compat_route.path_regex = re.compile(
+            "^/prometheus/metrics(?P<path>.*)$")
+        self.app.routes.append(compat_route)
 
     def register_mm_encoder_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
         self.app.add_api_route("/v1/chat/completions",
@@ -668,7 +671,7 @@ class OpenAIServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
 

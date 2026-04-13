@@ -45,6 +45,7 @@ class MetricsCollector:
             trtllm_generation_tokens_total
 
         Iteration-level metrics:
+            trtllm_iteration_counter
             trtllm_kv_cache_hit_rate
             trtllm_kv_cache_utilization
             trtllm_kv_cache_host_utilization
@@ -63,17 +64,24 @@ class MetricsCollector:
             trtllm_num_requests_waiting
             trtllm_num_requests_completed_total
             trtllm_max_num_active_requests
+            trtllm_num_new_active_requests
+            trtllm_new_active_requests_queue_latency_seconds
             trtllm_iteration_latency_seconds
             trtllm_gpu_memory_usage_bytes
             trtllm_cpu_memory_usage_bytes
             trtllm_pinned_memory_usage_bytes
             trtllm_max_batch_size_static
             trtllm_max_batch_size_runtime
+            trtllm_max_batch_size_tuner_recommended
             trtllm_max_num_tokens_runtime
+            trtllm_max_num_tokens_static
+            trtllm_max_num_tokens_tuner_recommended
             trtllm_kv_cache_max_blocks
             trtllm_kv_cache_free_blocks
             trtllm_kv_cache_used_blocks
             trtllm_kv_cache_tokens_per_block
+            trtllm_kv_cache_alloc_total_blocks
+            trtllm_kv_cache_alloc_new_blocks
             trtllm_num_context_requests
             trtllm_num_generation_requests
             trtllm_num_paused_requests
@@ -287,6 +295,12 @@ class MetricsCollector:
             "Total bytes copied within GPU (intra-device block copies)",
             labelnames=self.labels.keys())
 
+        # Iteration counter
+        self.iteration_counter = Gauge(
+            name=self.metric_prefix + "iteration_counter",
+            documentation="Current engine iteration number",
+            labelnames=self.labels.keys())
+
         # Queue & load metrics
         self.num_requests_running = Gauge(
             name=self.metric_prefix + "num_requests_running",
@@ -303,6 +317,16 @@ class MetricsCollector:
         self.max_num_active_requests = Gauge(
             name=self.metric_prefix + "max_num_active_requests",
             documentation="Maximum number of active requests",
+            labelnames=self.labels.keys())
+        self.num_new_active_requests = Gauge(
+            name=self.metric_prefix + "num_new_active_requests",
+            documentation=
+            "Number of new requests that became active in the last iteration",
+            labelnames=self.labels.keys())
+        self.new_active_requests_queue_latency_seconds = Gauge(
+            name=self.metric_prefix +
+            "new_active_requests_queue_latency_seconds",
+            documentation="Queue latency for newly activated requests",
             labelnames=self.labels.keys())
 
         # Iteration latency
@@ -338,6 +362,18 @@ class MetricsCollector:
             name=self.metric_prefix + "max_num_tokens_runtime",
             documentation="Runtime maximum number of tokens",
             labelnames=self.labels.keys())
+        self.max_batch_size_tuner_recommended = Gauge(
+            name=self.metric_prefix + "max_batch_size_tuner_recommended",
+            documentation="Tuner-recommended maximum batch size",
+            labelnames=self.labels.keys())
+        self.max_num_tokens_static = Gauge(
+            name=self.metric_prefix + "max_num_tokens_static",
+            documentation="Static (configured) maximum number of tokens",
+            labelnames=self.labels.keys())
+        self.max_num_tokens_tuner_recommended = Gauge(
+            name=self.metric_prefix + "max_num_tokens_tuner_recommended",
+            documentation="Tuner-recommended maximum number of tokens",
+            labelnames=self.labels.keys())
 
         # KV cache block metrics
         self.kv_cache_max_blocks = Gauge(
@@ -355,6 +391,16 @@ class MetricsCollector:
         self.kv_cache_tokens_per_block = Gauge(
             name=self.metric_prefix + "kv_cache_tokens_per_block",
             documentation="Number of tokens per KV cache block",
+            labelnames=self.labels.keys())
+        self.kv_cache_alloc_total_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_alloc_total_blocks",
+            documentation=
+            "Total KV cache blocks allocated in the last iteration",
+            labelnames=self.labels.keys())
+        self.kv_cache_alloc_new_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_alloc_new_blocks",
+            documentation=
+            "Newly allocated KV cache blocks in the last iteration",
             labelnames=self.labels.keys())
 
         # Inflight batching metrics
@@ -558,6 +604,10 @@ class MetricsCollector:
             - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
             - inflightBatchingStats and specDecodingStats are only present when applicable.
         """
+        # Iteration counter
+        if "iter" in iteration_stats:
+            self._log_gauge(self.iteration_counter, iteration_stats["iter"])
+
         # Top-level queue & load metrics
         if "numActiveRequests" in iteration_stats:
             self._log_gauge(self.num_requests_running,
@@ -573,6 +623,13 @@ class MetricsCollector:
         if "maxNumActiveRequests" in iteration_stats:
             self._log_gauge(self.max_num_active_requests,
                             iteration_stats["maxNumActiveRequests"])
+        if "numNewActiveRequests" in iteration_stats:
+            self._log_gauge(self.num_new_active_requests,
+                            iteration_stats["numNewActiveRequests"])
+        if "newActiveRequestsQueueLatencyMS" in iteration_stats:
+            self._log_gauge(
+                self.new_active_requests_queue_latency_seconds,
+                iteration_stats["newActiveRequestsQueueLatencyMS"] / 1000.0)
 
         # Iteration latency (convert ms to seconds)
         if "iterLatencyMS" in iteration_stats:
@@ -600,6 +657,15 @@ class MetricsCollector:
         if "maxNumTokensRuntime" in iteration_stats:
             self._log_gauge(self.max_num_tokens_runtime,
                             iteration_stats["maxNumTokensRuntime"])
+        if "maxBatchSizeTunerRecommended" in iteration_stats:
+            self._log_gauge(self.max_batch_size_tuner_recommended,
+                            iteration_stats["maxBatchSizeTunerRecommended"])
+        if "maxNumTokensStatic" in iteration_stats:
+            self._log_gauge(self.max_num_tokens_static,
+                            iteration_stats["maxNumTokensStatic"])
+        if "maxNumTokensTunerRecommended" in iteration_stats:
+            self._log_gauge(self.max_num_tokens_tuner_recommended,
+                            iteration_stats["maxNumTokensTunerRecommended"])
 
         # KV cache stats
         if kv_stats := iteration_stats.get("kvCacheStats"):
@@ -635,6 +701,12 @@ class MetricsCollector:
             if "tokensPerBlock" in kv_stats:
                 self._log_gauge(self.kv_cache_tokens_per_block,
                                 kv_stats["tokensPerBlock"])
+            if "allocTotalBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_alloc_total_blocks,
+                                kv_stats["allocTotalBlocks"])
+            if "allocNewBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_alloc_new_blocks,
+                                kv_stats["allocNewBlocks"])
 
         # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):

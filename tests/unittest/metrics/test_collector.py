@@ -56,23 +56,31 @@ def _get_counter_value(collector, metric_name: str):
 
 
 SAMPLE_ITERATION_STATS = {
+    "iter": 42,
     "numActiveRequests": 5,
     "numQueuedRequests": 3,
     "numCompletedRequests": 2,
     "maxNumActiveRequests": 10,
+    "numNewActiveRequests": 3,
+    "newActiveRequestsQueueLatencyMS": 12.5,
     "iterLatencyMS": 15.5,
     "gpuMemUsage": 4_000_000_000,
     "cpuMemUsage": 2_000_000_000,
     "pinnedMemUsage": 500_000_000,
     "maxBatchSizeStatic": 64,
     "maxBatchSizeRuntime": 32,
+    "maxBatchSizeTunerRecommended": 48,
     "maxNumTokensRuntime": 8192,
+    "maxNumTokensStatic": 16384,
+    "maxNumTokensTunerRecommended": 12288,
     "kvCacheStats": {
         "cacheHitRate": 0.85,
         "maxNumBlocks": 1000,
         "freeNumBlocks": 400,
         "usedNumBlocks": 600,
         "tokensPerBlock": 64,
+        "allocTotalBlocks": 15,
+        "allocNewBlocks": 7,
     },
     "inflightBatchingStats": {
         "numContextRequests": 2,
@@ -131,6 +139,57 @@ class TestIterationStatsTopLevel:
         assert _get_gauge_value(collector, "max_batch_size_static") == 64
         assert _get_gauge_value(collector, "max_batch_size_runtime") == 32
         assert _get_gauge_value(collector, "max_num_tokens_runtime") == 8192
+
+
+class TestNewIterationStatsFields:
+    """Test iteration stats fields added for full parity with JSON iteration_stats."""
+
+    def test_iteration_counter(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "iteration_counter") == 42
+
+    def test_num_new_active_requests(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "num_new_active_requests") == 3
+
+    def test_new_active_requests_queue_latency_ms_to_seconds(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(
+            collector, "new_active_requests_queue_latency_seconds"
+        ) == pytest.approx(0.0125)
+
+    def test_max_batch_size_tuner_recommended(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "max_batch_size_tuner_recommended") == 48
+
+    def test_max_num_tokens_static(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "max_num_tokens_static") == 16384
+
+    def test_max_num_tokens_tuner_recommended(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "max_num_tokens_tuner_recommended") == 12288
+
+    def test_kv_cache_alloc_total_blocks(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "kv_cache_alloc_total_blocks") == 15
+
+    def test_kv_cache_alloc_new_blocks(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "kv_cache_alloc_new_blocks") == 7
+
+    def test_missing_new_fields_no_error(self, collector):
+        """New fields being absent should not cause errors."""
+        minimal_stats = {"numActiveRequests": 1}
+        collector.log_iteration_stats(minimal_stats)
+
+    def test_iteration_counter_updates_on_successive_calls(self, collector):
+        collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
+        assert _get_gauge_value(collector, "iteration_counter") == 42
+
+        updated_stats = {**SAMPLE_ITERATION_STATS, "iter": 99}
+        collector.log_iteration_stats(updated_stats)
+        assert _get_gauge_value(collector, "iteration_counter") == 99
 
 
 class TestKVCacheStats:
